@@ -77,10 +77,10 @@ jobs:
         shell: powershell
         run: >
           python scripts/build_clpk.py "${{ vars.ETP_WORK_DIR }}/etp_output/common_exp.zip"
-          --output "${{ vars.ETP_WORK_DIR }}/etp_output/español_exp.clpk"
+          --output "${{ vars.ETP_WORK_DIR }}/etp_output/espanol_exp.clpk"
           --author "ArkadelaTierra"
           --language es
-          --download-url "https://github.com/${{ github.repository }}/releases/download/nightly/español_exp.clpk"
+          --download-url "https://github.com/${{ github.repository }}/releases/download/nightly/espanol_exp.clpk"
 
       - name: Upload review CSV and Clarity DBs as workflow artifacts
         if: always()
@@ -103,7 +103,7 @@ jobs:
           prerelease: true
           files: |
             ${{ vars.ETP_WORK_DIR }}/etp_output/espanol.clpk
-            ${{ vars.ETP_WORK_DIR }}/etp_output/español_exp.clpk
+            ${{ vars.ETP_WORK_DIR }}/etp_output/espanol_exp.clpk
             ${{ vars.ETP_WORK_DIR }}/etp_output/paste_in_dqxclarity.zip
             ${{ vars.ETP_WORK_DIR }}/etp_output/readme.md
 
