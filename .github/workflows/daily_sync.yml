@@ -67,10 +67,10 @@ jobs:
         shell: powershell
         run: >
           python scripts/build_clpk.py "${{ vars.ETP_WORK_DIR }}/etp_output/common.zip"
-          --output "${{ vars.ETP_WORK_DIR }}/etp_output/español.clpk"
+          --output "${{ vars.ETP_WORK_DIR }}/etp_output/espanol.clpk"
           --author "ArkadelaTierra"
           --language es
-          --download-url "https://github.com/${{ github.repository }}/releases/download/nightly/español.clpk"
+          --download-url "https://github.com/${{ github.repository }}/releases/download/nightly/espanol.clpk"
 
       - name: Build espanol_exp.clpk from common_exp.zip
         if: success()
@@ -93,7 +93,7 @@ jobs:
             ${{ vars.ETP_WORK_DIR }}/clarity_dbs/clarity_dialog.db
           if-no-files-found: ignore
 
-      - - name: Publish nightly Release
+      - name: Publish nightly Release
         if: success()
         uses: softprops/action-gh-release@v2
         with:
@@ -102,7 +102,7 @@ jobs:
           body: "Ultima corrida exitosa del pipeline: ${{ github.run_id }}, ${{ github.event.repository.updated_at }}"
           prerelease: true
           files: |
-            ${{ vars.ETP_WORK_DIR }}/etp_output/español.clpk
+            ${{ vars.ETP_WORK_DIR }}/etp_output/espanol.clpk
             ${{ vars.ETP_WORK_DIR }}/etp_output/español_exp.clpk
             ${{ vars.ETP_WORK_DIR }}/etp_output/paste_in_dqxclarity.zip
             ${{ vars.ETP_WORK_DIR }}/etp_output/readme.md
