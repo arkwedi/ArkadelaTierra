@@ -78,7 +78,7 @@ jobs:
         run: >
           python scripts/build_clpk.py "${{ vars.ETP_WORK_DIR }}/etp_output/common_exp.zip"
           --output "${{ vars.ETP_WORK_DIR }}/etp_output/espanol_exp.clpk"
-          --author "(exp.) ArkadelaTierra/SatodeSable"
+          --author "-experimental- ArkadelaTierra_SatodeSable"
           --language es
           --download-url "https://github.com/${{ github.repository }}/releases/download/nightly/espanol_exp.clpk"
 

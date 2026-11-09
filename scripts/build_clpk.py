@@ -19,7 +19,7 @@ Format (confirmed by parsing a real .clpk byte-for-byte):
 
 Usage:
     python build_clpk.py common.zip --output espanol.clpk \\
-        --author "dqx-hispano" --language es \\
+        --author "ArkadelaTierra" --language es \\
         --download-url "https://github.com/arkwedi/dqx-hispano/releases/download/nightly/common.zip"
 """
 
