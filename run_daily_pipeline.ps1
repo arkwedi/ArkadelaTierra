@@ -186,10 +186,38 @@ if ($staleFiles) {
     Write-Host "OK: todos los archivos en common/ son de esta corrida." -ForegroundColor Green
 }
 
-Write-Host "`n=== Paso 7: comprimir common/ -> common.zip ===" -ForegroundColor Cyan
-New-Item -ItemType Directory -Force -Path (Split-Path $CommonZipOutput) | Out-Null
-if (Test-Path $CommonZipOutput) { Remove-Item $CommonZipOutput }
-Compress-Archive -Path $CommonFolder -DestinationPath $CommonZipOutput
+Write-Host "`n=== Paso 7: comprimir common/ y plugins/ -> zips de salida ===" -ForegroundColor Cyan
+$EtpOutputFolder = Join-Path $EtpWorkDir "etp_output"
+New-Item -ItemType Directory -Force -Path $EtpOutputFolder | Out-Null
+
+$CommonZipOutput = Join-Path $EtpOutputFolder "common.zip"
+$CommonExpZipOutput = Join-Path $EtpOutputFolder "common_exp.zip"
+
+if (Test-Path $CommonZipOutput) { Remove-Item $CommonZipOutput -Force }
+if (Test-Path $CommonExpZipOutput) { Remove-Item $CommonExpZipOutput -Force }
+
+# 1. Zip vanilla: solo common/
+Compress-Archive -Path $CommonFolder -DestinationPath $CommonZipOutput -Force
+Write-Host "common.zip generado (solo common)" -ForegroundColor Green
+
+# 2. Zip experimental: common/ + plugins/ (si existe plugins/)
+$PluginsFolder = Join-Path $EtpWorkDir "plugins"
+if (Test-Path $PluginsFolder) {
+    $ExpStaging = Join-Path $EtpOutputFolder "exp_staging"
+    if (Test-Path $ExpStaging) { Remove-Item $ExpStaging -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path (Join-Path $ExpStaging "common") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $ExpStaging "plugins") | Out-Null
+    
+    Copy-Item "$CommonFolder\*" (Join-Path $ExpStaging "common") -Recurse -Force
+    Copy-Item "$PluginsFolder\*" (Join-Path $ExpStaging "plugins") -Recurse -Force
+    
+    Compress-Archive -Path "$ExpStaging\*" -DestinationPath $CommonExpZipOutput -Force
+    Remove-Item $ExpStaging -Recurse -Force
+    Write-Host "common_exp.zip generado (common + plugins)" -ForegroundColor Green
+} else {
+    Write-Warning "Carpeta plugins no encontrada en $PluginsFolder, se usara solo common.zip para el experimental"
+    Copy-Item $CommonZipOutput $CommonExpZipOutput -Force
+}
 
 Write-Host "`n=== Paso 8: armar paste_in_dqxclarity.zip ===" -ForegroundColor Cyan
 $PasteStaging = Join-Path $EtpWorkDir "etp_output\paste_in_dqxclarity_staging\dqxclarity"
