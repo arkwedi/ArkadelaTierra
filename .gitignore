@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# LocalScripts & tests
+.scripts/import_csv_to_supabase.py
+.scripts/bulk_mt_translate.py
+.scripts/prueba.csv
+.scripts/pruebas_traduccion.csv
+.scripts/glossary.db
