@@ -188,6 +188,35 @@ CLARITY_JSON_CATEGORY_MAP = {
     "eventTextSysEventaClient": "story_names",
 }
 
+# Diccionario de reemplazo para limpieza de hardware con restricción de encoding
+REPLACE_MAP = {
+    # Minúsculas acentuadas, con diéresis, tildes y cedilla
+    'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u',
+    'à': 'a', 'è': 'e', 'ì': 'i', 'ò': 'o', 'ù': 'u',
+    'â': 'a', 'ê': 'e', 'î': 'i', 'ô': 'o', 'û': 'u',
+    'ä': 'a', 'ë': 'e', 'ï': 'i', 'ö': 'o', 'ü': 'u', 'ÿ': 'y',
+    'ã': 'a', 'õ': 'o', 'ç': 'c',
+    
+    # Mayúsculas acentuadas, con diéresis, tildes y cedilla
+    'Á': 'A', 'É': 'E', 'Í': 'I', 'Ó': 'O', 'Ú': 'U',
+    'À': 'A', 'È': 'E', 'Ì': 'I', 'Ò': 'O', 'Ù': 'U',
+    'Â': 'A', 'Ê': 'E', 'Î': 'I', 'Ô': 'O', 'Û': 'U',
+    'Ä': 'A', 'Ë': 'E', 'Ï': 'I', 'Ö': 'O', 'Ü': 'U',
+    'Ã': 'A', 'Õ': 'O', 'Ç': 'C',
+
+    # Casos particulares: Letra Ñ / ñ
+    'ñ': 'ni', 'Ñ': 'NI',
+
+    # Símbolos de apertura/interrogación/exclamación y ordinales
+    '¿': '', '¡': '', 'º': '', 'ª': ''
+}
+
+def clean_restricted_text(text):
+    if not text:
+        return text
+    for char, replacement in REPLACE_MAP.items():
+        text = text.replace(char, replacement)
+    return text
 
 def resolve_value(row, lang, use_fallback):
     """row = (file, entry_id, ja, en, es). Returns the text to use as the
@@ -386,6 +415,8 @@ def main():
     parser.add_argument("--glossary-max-len", type=int, default=DEFAULT_GLOSSARY_MAX_LEN,
                          help=f"Max ja character length to count as a 'term' for glossary/m00_strings "
                               f"(default: {DEFAULT_GLOSSARY_MAX_LEN})")
+    parser.add_argument("--clean-encoding", action="store_true",
+                         help="Aplica REPLACE_MAP para restringir caracteres compatibles con el juego")
     args = parser.parse_args()
 
     if (args.glossary_db or args.dialog_db) and args.lang != "es":
@@ -415,6 +446,8 @@ def main():
     for row in fetch_rows(conn, file_filter):
         file_key, entry_id, ja, en, es = row
         value = resolve_value(row, args.lang, use_fallback)
+        if args.clean_encoding:
+            value = clean_restricted_text(value)
         total += 1
         if args.lang == "es" and use_fallback and not es and value:
             fallback_used += 1

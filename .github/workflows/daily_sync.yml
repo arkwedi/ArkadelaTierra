@@ -62,7 +62,7 @@ jobs:
           CLARITY_DIALOG_DB_PATH: ${{ vars.CLARITY_DIALOG_DB_PATH }}
         run: ./run_daily_pipeline.ps1
 
-      - name: Build espanol.clpk from common.zip
+      - name: Build español.clpk (Vanilla) desde common.zip
         if: success()
         shell: powershell
         run: >
@@ -72,7 +72,7 @@ jobs:
           --language es
           --download-url "https://github.com/${{ github.repository }}/releases/download/nightly/espanol.clpk"
 
-      - name: Build espanol_exp.clpk from common_exp.zip
+      - name: Build español_exp.clpk (Experimental) desde common_exp.zip
         if: success()
         shell: powershell
         run: >
