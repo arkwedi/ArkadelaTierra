@@ -209,22 +209,22 @@ if ($staleFiles) {
 }
 
 
-# --- Paso 7: Comprimir paquetes finales (Vanilla y Experimental) ---
-Write-Host "`n=== Paso 7: Comprimir common/ y plugins/ -> zips de salida ===" -ForegroundColor Cyan
+# --- Paso 7: Comprimir paquetes finales (Vanilla y Experimental separados) ---
+Write-Host "`n=== Paso 7: Comprimir carpetas en zips independientes ===" -ForegroundColor Cyan
 $EtpOutputFolder = Join-Path $EtpWorkDir "etp_output"
 New-Item -ItemType Directory -Force -Path $EtpOutputFolder | Out-Null
 
-$CommonZipOutput = Join-Path $EtpOutputFolder "common.zip"
-$CommonExpZipOutput = Join-Path $EtpOutputFolder "common_exp.zip"
+$CommonZipOutput = Join-Path $EtpOutputFolder "common.zip"          # Exclusivamente Vanilla (sin plugins)
+$CommonExpZipOutput = Join-Path $EtpOutputFolder "common_exp.zip"    # Experimental (con plugins)
 
 if (Test-Path $CommonZipOutput) { Remove-Item $CommonZipOutput -Force }
 if (Test-Path $CommonExpZipOutput) { Remove-Item $CommonExpZipOutput -Force }
 
-# 1. Zip vanilla: solo common/ (versión limpia con restricciones de encoding)
+# 1. Zip Vanilla: SOLO la carpeta common actual (que ya fue construida con --clean-encoding y SIN plugins)
 Compress-Archive -Path "$CommonFolder\*" -DestinationPath $CommonZipOutput -Force
-Write-Host "common.zip generado (solo common vanilla)" -ForegroundColor Green
+Write-Host "common.zip generado (Vanilla: limpio de caracteres y sin plugins)" -ForegroundColor Green
 
-# 2. Zip experimental: common/ (versión con caracteres normales) + plugins/ (si existe plugins/)
+# 2. Zip Experimental: Carpeta common experimental (con tildes/eñes intactas) + carpeta plugins
 $PluginsFolder = Join-Path $EtpWorkDir "plugins"
 $ExpFinalStaging = Join-Path $EtpOutputFolder "exp_final_staging"
 if (Test-Path $ExpFinalStaging) { Remove-Item $ExpFinalStaging -Recurse -Force }
@@ -235,12 +235,16 @@ Copy-Item "$ExpStagingCommon\*" (Join-Path $ExpFinalStaging "common") -Recurse -
 if (Test-Path $PluginsFolder) {
     New-Item -ItemType Directory -Force -Path (Join-Path $ExpFinalStaging "plugins") | Out-Null
     Copy-Item "$PluginsFolder\*" (Join-Path $ExpFinalStaging "plugins") -Recurse -Force
+    Write-Host "Carpeta plugins integrada al paquete experimental." -ForegroundColor DarkGray
+} else {
+    Write-Warning "Carpeta plugins no encontrada en $PluginsFolder"
 }
 
 Compress-Archive -Path "$ExpFinalStaging\*" -DestinationPath $CommonExpZipOutput -Force
 Remove-Item $ExpStagingCommon -Recurse -Force
 Remove-Item $ExpFinalStaging -Recurse -Force
-Write-Host "common_exp.zip generado (common experimental + plugins)" -ForegroundColor Green
+Write-Host "common_exp.zip generado (Experimental: caracteres normales + plugins)" -ForegroundColor Green
+
 Write-Host "`n=== Paso 8: armar paste_in_dqxclarity.zip ===" -ForegroundColor Cyan
 $PasteStaging = Join-Path $EtpWorkDir "etp_output\paste_in_dqxclarity_staging\dqxclarity"
 $PasteMiscFiles = Join-Path $PasteStaging "misc_files"
