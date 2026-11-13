@@ -20,7 +20,9 @@
 #                                      glossary.db / clarity_dialog.db en
 #                                      esa misma carpeta
 #   6. etp.exe rebuild . .          -> JSON -> ETP binaries in common/
-#   7. Compress common/ -> common.zip
+#   7. Empaquetar DOS zips con la misma estructura (carpetas en la raiz):
+#        common.zip     (Vanilla)      -> common/                (clean-encoding, SIN plugin)
+#        common_exp.zip (Experimental) -> common/ + plugin       (sin clean-encoding, CON plugin)
 #
 # This script is meant to be run the same way whether you trigger it by
 # hand or via a scheduled GitHub Actions self-hosted runner -- all the
@@ -30,6 +32,50 @@
 # connection string (pooler, not direct -- see earlier notes on IPv6).
 
 $ErrorActionPreference = "Stop"
+
+# --- Helpers de empaquetado ---
+# Compress-Archive de Windows PowerShell 5.1 (el que usa "shell: powershell" en el
+# workflow) guarda las rutas internas con "\" en vez de "/", y segun como se arme
+# el -Path la estructura cambia ("carpeta\*" mete el contenido en la raiz, "carpeta"
+# mete la carpeta). Para que ambos zips salgan IDENTICOS en estructura y con "/"
+# estandar, los armamos explicitamente: cada carpeta origen va bajo un nombre fijo
+# en la raiz del zip.
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+function New-ZipFromFolders {
+    param(
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Folders   # nombre_en_zip -> carpeta origen
+    )
+    if (Test-Path $DestinationPath) { Remove-Item $DestinationPath -Force }
+    $zip = [System.IO.Compression.ZipFile]::Open($DestinationPath, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($rootName in $Folders.Keys) {
+            $srcFolder = (Resolve-Path -LiteralPath $Folders[$rootName]).Path.TrimEnd('\')
+            foreach ($file in (Get-ChildItem -LiteralPath $srcFolder -Recurse -File -Force)) {
+                $relative  = $file.FullName.Substring($srcFolder.Length + 1).Replace('\', '/')
+                $entryName = "$rootName/$relative"
+                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $zip, $file.FullName, $entryName, [System.IO.Compression.CompressionLevel]::Optimal)
+            }
+        }
+    }
+    finally {
+        $zip.Dispose()
+    }
+}
+
+function Get-ZipTopLevelNames {
+    param([Parameter(Mandatory)][string]$ZipPath)
+    $z = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        return @($z.Entries | ForEach-Object { ($_.FullName -split '/')[0] } | Sort-Object -Unique)
+    }
+    finally {
+        $z.Dispose()
+    }
+}
 
 # --- Cargar variables desde .env si existe (no sobrescribe variables ya definidas en la sesion) ---
 $envFile = Join-Path $PSScriptRoot ".env"
@@ -190,6 +236,7 @@ python scripts\export_translations.py @exportArgsVanilla
 if ($LASTEXITCODE -ne 0) { Write-Error "export_translations.py (vanilla) fallo"; exit 1 }
 
 Write-Host "`n=== Paso 6.2 (Vanilla): etp.exe rebuild (vanilla) ===" -ForegroundColor Cyan
+$vanillaRebuildStart = Get-Date
 Push-Location $EtpWorkDir
 try {
     & $EtpExe rebuild . .
@@ -199,14 +246,30 @@ finally {
     Pop-Location
 }
 
-# Verificacion de frescura para common vanilla
-$staleThreshold = (Get-Date).AddMinutes(-10)
-$staleFiles = Get-ChildItem $CommonFolder -Recurse -File | Where-Object { $_.LastWriteTime -lt $staleThreshold }
+# Verificacion 1: archivos de common/ que el rebuild vanilla NO toco (pueden ser
+# restos del rebuild experimental). Se compara contra el INICIO de este rebuild
+# (antes se comparaba contra "hace 10 min", lo que dejaba pasar los archivos del
+# rebuild experimental como si fueran frescos).
+$staleFiles = Get-ChildItem $CommonFolder -Recurse -File | Where-Object { $_.LastWriteTime -lt $vanillaRebuildStart }
 if ($staleFiles) {
-    Write-Warning "$($staleFiles.Count) archivo(s) en common/ (vanilla) NO se modificaron en esta corrida."
-} else {
-    Write-Host "OK: todos los archivos en common/ (vanilla) son de esta corrida." -ForegroundColor Green
+    Write-Host "Aviso: $($staleFiles.Count) archivo(s) en common/ no fueron reescritos por el rebuild vanilla (normal si su texto no cambia con clean-encoding)." -ForegroundColor DarkGray
 }
+
+# Verificacion 2 (la importante): vanilla y experimental DEBEN diferir en al menos un
+# archivo (tildes/enes limpiadas). Si son identicos, el rebuild vanilla no sobreescribio
+# nada y common.zip saldria con el texto experimental.
+$vanillaDiffersFromExp = $false
+foreach ($vf in (Get-ChildItem $CommonFolder -Recurse -File)) {
+    $relPath = $vf.FullName.Substring($CommonFolder.Length).TrimStart('\')
+    $ef = Join-Path $ExpStagingCommon $relPath
+    if (-not (Test-Path $ef)) { $vanillaDiffersFromExp = $true; break }
+    if ((Get-Item $ef).Length -ne $vf.Length) { $vanillaDiffersFromExp = $true; break }
+    if ((Get-FileHash $vf.FullName -Algorithm MD5).Hash -ne (Get-FileHash $ef -Algorithm MD5).Hash) { $vanillaDiffersFromExp = $true; break }
+}
+if (-not $vanillaDiffersFromExp) {
+    throw "common/ (vanilla) es identico a common/ (experimental): el rebuild vanilla no aplico clean-encoding. Abortando para no publicar zips duplicados."
+}
+Write-Host "OK: common/ (vanilla) difiere de la version experimental, como corresponde." -ForegroundColor Green
 
 
 # --- Paso 7: Comprimir paquetes finales (Vanilla y Experimental separados) ---
@@ -214,36 +277,53 @@ Write-Host "`n=== Paso 7: Comprimir carpetas en zips independientes ===" -Foregr
 $EtpOutputFolder = Join-Path $EtpWorkDir "etp_output"
 New-Item -ItemType Directory -Force -Path $EtpOutputFolder | Out-Null
 
-$CommonZipOutput = Join-Path $EtpOutputFolder "common.zip"          # Exclusivamente Vanilla (sin plugins)
-$CommonExpZipOutput = Join-Path $EtpOutputFolder "common_exp.zip"    # Experimental (con plugins)
+$CommonZipOutput    = Join-Path $EtpOutputFolder "common.zip"      # Vanilla: common/ limpio, SIN plugin
+$CommonExpZipOutput = Join-Path $EtpOutputFolder "common_exp.zip"  # Experimental: common/ sin limpiar + plugin
 
-if (Test-Path $CommonZipOutput) { Remove-Item $CommonZipOutput -Force }
-if (Test-Path $CommonExpZipOutput) { Remove-Item $CommonExpZipOutput -Force }
-
-# 1. Zip Vanilla: SOLO la carpeta common actual (que ya fue construida con --clean-encoding y SIN plugins)
-Compress-Archive -Path "$CommonFolder\*" -DestinationPath $CommonZipOutput -Force
-Write-Host "common.zip generado (Vanilla: limpio de caracteres y sin plugins)" -ForegroundColor Green
-
-# 2. Zip Experimental: Carpeta common experimental (con tildes/eñes intactas) + carpeta plugins
-$PluginsFolder = Join-Path $EtpWorkDir "plugins"
-$ExpFinalStaging = Join-Path $EtpOutputFolder "exp_final_staging"
-if (Test-Path $ExpFinalStaging) { Remove-Item $ExpFinalStaging -Recurse -Force }
-
-New-Item -ItemType Directory -Force -Path (Join-Path $ExpFinalStaging "common") | Out-Null
-Copy-Item "$ExpStagingCommon\*" (Join-Path $ExpFinalStaging "common") -Recurse -Force
-
-if (Test-Path $PluginsFolder) {
-    New-Item -ItemType Directory -Force -Path (Join-Path $ExpFinalStaging "plugins") | Out-Null
-    Copy-Item "$PluginsFolder\*" (Join-Path $ExpFinalStaging "plugins") -Recurse -Force
-    Write-Host "Carpeta plugins integrada al paquete experimental." -ForegroundColor DarkGray
-} else {
-    Write-Warning "Carpeta plugins no encontrada en $PluginsFolder"
+# Localizar la carpeta plugin. Antes el script buscaba SOLO "plugins" en ETP_WORK_DIR y, si no
+# existia, solo emitia un warning y publicaba el experimental SIN plugin. Ahora acepta
+# "plugin" o "plugins" (en ETP_WORK_DIR o junto al script) y FALLA si no la encuentra.
+$PluginFolder = $null
+$pluginCandidates = @(
+    (Join-Path $EtpWorkDir "plugin"),
+    (Join-Path $EtpWorkDir "plugins"),
+    (Join-Path $PSScriptRoot "plugin"),
+    (Join-Path $PSScriptRoot "plugins")
+)
+foreach ($candidate in $pluginCandidates) {
+    if (Test-Path $candidate -PathType Container) { $PluginFolder = $candidate; break }
 }
+if (-not $PluginFolder) {
+    throw "No se encontro la carpeta plugin para el paquete experimental. Busque en:`n  " + ($pluginCandidates -join "`n  ")
+}
+$PluginZipName = Split-Path $PluginFolder -Leaf
+Write-Host "Carpeta plugin encontrada: $PluginFolder" -ForegroundColor DarkGray
 
-Compress-Archive -Path "$ExpFinalStaging\*" -DestinationPath $CommonExpZipOutput -Force
+# 1. Vanilla: SOLO common/ (construido con --clean-encoding). Sin plugin.
+New-ZipFromFolders -DestinationPath $CommonZipOutput -Folders ([ordered]@{
+    "common" = $CommonFolder
+})
+
+# 2. Experimental: common/ (construido SIN clean-encoding, respaldado en el staging) + plugin
+New-ZipFromFolders -DestinationPath $CommonExpZipOutput -Folders ([ordered]@{
+    "common"       = $ExpStagingCommon
+    $PluginZipName = $PluginFolder
+})
+
 Remove-Item $ExpStagingCommon -Recurse -Force
-Remove-Item $ExpFinalStaging -Recurse -Force
-Write-Host "common_exp.zip generado (Experimental: caracteres normales + plugins)" -ForegroundColor Green
+
+# Verificacion de la estructura final de ambos zips
+$vanillaTop = Get-ZipTopLevelNames $CommonZipOutput
+$expTop     = Get-ZipTopLevelNames $CommonExpZipOutput
+
+if (($vanillaTop -join ",") -ne "common") {
+    throw "common.zip (vanilla) tiene una estructura inesperada: $($vanillaTop -join ', ') (se esperaba solo 'common')"
+}
+if ($expTop -notcontains "common" -or $expTop -notcontains $PluginZipName -or $expTop.Count -ne 2) {
+    throw "common_exp.zip (experimental) tiene una estructura inesperada: $($expTop -join ', ') (se esperaba 'common' + '$PluginZipName')"
+}
+Write-Host "common.zip generado (Vanilla): [$($vanillaTop -join ', ')] -> clean-encoding, sin plugin" -ForegroundColor Green
+Write-Host "common_exp.zip generado (Experimental): [$($expTop -join ', ')] -> texto sin limpiar, con plugin" -ForegroundColor Green
 
 Write-Host "`n=== Paso 8: armar paste_in_dqxclarity.zip ===" -ForegroundColor Cyan
 $PasteStaging = Join-Path $EtpWorkDir "etp_output\paste_in_dqxclarity_staging\dqxclarity"
@@ -274,5 +354,6 @@ Compress-Archive -Path (Join-Path $SourceCacheDir "*") -DestinationPath $SourceC
 Write-Host "source_cache.zip generado en: $SourceCacheZip" -ForegroundColor Green
 
 Write-Host "`n=== Listo ===" -ForegroundColor Green
-Write-Host "common.zip generado en: $CommonZipOutput"
-Write-Host "espanol.clpk generado en: $EspanolClpkOutput"
+Write-Host "common.zip (vanilla) generado en: $CommonZipOutput"
+Write-Host "common_exp.zip (experimental) generado en: $CommonExpZipOutput"
+Write-Host "(los .clpk los genera el workflow con scripts/build_clpk.py)"
