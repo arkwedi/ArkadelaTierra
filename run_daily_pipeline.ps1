@@ -133,19 +133,21 @@ if (Test-Path $ChangedReviewCsv) {
     Write-Host "`n[!] Hay entradas con JA modificado que requieren revision manual: $ChangedReviewCsv" -ForegroundColor Yellow
 }
 
-# --- Versión Experimental (Caracteres normales) ---
-Write-Host "`n=== Paso 5.1 (Experimental): Supabase -> JSON normal + DBs de Clarity ===" -ForegroundColor Cyan
+Write-Host "`n=== Paso 5: Supabase -> JSON con ES + DBs de Clarity (export_translations.py) ===" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path $ClarityDbOutput | Out-Null
-$exportArgsExp = @(
+$exportArgs = @(
     "--lang", "es", "--all",
     "--output", $RawJsonFolder,
     "--build-clarity-dbs",
     "--clarity-db-output", $ClarityDbOutput
 )
-python scripts\export_translations.py @exportArgsExp
-if ($LASTEXITCODE -ne 0) { Write-Error "export_translations.py (experimental) fallo"; exit 1 }
+python scripts\export_translations.py @exportArgs
+if ($LASTEXITCODE -ne 0) { Write-Error "export_translations.py fallo"; exit 1 }
+Write-Host "JSON actualizados directamente en $RawJsonFolder" -ForegroundColor Green
+Write-Host "glossary.db / clarity_dialog.db generadas en $ClarityDbOutput (fuera de json\_lang\en)" -ForegroundColor Green
 
-# Copiamos bases de datos de Clarity si están configuradas
+# Copiamos desde $ClarityDbOutput (NO desde json\_lang\en) a donde tu
+# Clarity local las lee, si configuraste esas rutas.
 $generatedGlossaryDb = Join-Path $ClarityDbOutput "glossary.db"
 $generatedDialogDb   = Join-Path $ClarityDbOutput "clarity_dialog.db"
 if ($ClarityGlossaryDb -and (Test-Path $generatedGlossaryDb)) {
@@ -157,11 +159,11 @@ if ($ClarityDialogDb -and (Test-Path $generatedDialogDb)) {
     Write-Host "clarity_dialog.db copiada a $ClarityDialogDb"
 }
 
-Write-Host "`n=== Paso 6.1 (Experimental): etp.exe rebuild (experimental) ===" -ForegroundColor Cyan
+Write-Host "`n=== Paso 6: JSON -> ETP binario (etp.exe rebuild . .) ===" -ForegroundColor Cyan
 Push-Location $EtpWorkDir
 try {
     & $EtpExe rebuild . .
-    if ($LASTEXITCODE -ne 0) { throw "etp.exe rebuild experimental fallo" }
+    if ($LASTEXITCODE -ne 0) { throw "etp.exe rebuild fallo" }
 }
 finally {
     Pop-Location
@@ -169,48 +171,22 @@ finally {
 
 $CommonFolder = Join-Path $EtpWorkDir "common"
 if (-not (Test-Path $CommonFolder)) {
-    Write-Error "No se encontro la carpeta common/ tras el rebuild experimental en $CommonFolder"
+    Write-Error "No se encontro la carpeta common/ tras el rebuild en $CommonFolder"
     exit 1
 }
 
-# Respaldar temporalmente la carpeta common experimental antes de sobrescribirla
-$ExpStagingCommon = Join-Path $EtpWorkDir "common_exp_staging"
-if (Test-Path $ExpStagingCommon) { Remove-Item $ExpStagingCommon -Recurse -Force }
-Copy-Item $CommonFolder $ExpStagingCommon -Recurse
-
-
-# --- Versión Vanilla / Segura (Con limpieza de encoding / REPLACE_MAP) ---
-Write-Host "`n=== Paso 5.2 (Vanilla): Supabase -> JSON con limpieza de encoding ===" -ForegroundColor Cyan
-$exportArgsVanilla = @(
-    "--lang", "es", "--all",
-    "--output", $RawJsonFolder,
-    "--clean-encoding"
-)
-python scripts\export_translations.py @exportArgsVanilla
-if ($LASTEXITCODE -ne 0) { Write-Error "export_translations.py (vanilla) fallo"; exit 1 }
-
-Write-Host "`n=== Paso 6.2 (Vanilla): etp.exe rebuild (vanilla) ===" -ForegroundColor Cyan
-Push-Location $EtpWorkDir
-try {
-    & $EtpExe rebuild . .
-    if ($LASTEXITCODE -ne 0) { throw "etp.exe rebuild vanilla fallo" }
-}
-finally {
-    Pop-Location
-}
-
-# Verificacion de frescura para common vanilla
+# Verificacion de frescura: si algun archivo en common/ NO fue tocado en
+# los ultimos minutos, es una senal de que el rebuild no lo regeneraba
+# realmente (util para detectar el tipo de problema que reportaste).
 $staleThreshold = (Get-Date).AddMinutes(-10)
 $staleFiles = Get-ChildItem $CommonFolder -Recurse -File | Where-Object { $_.LastWriteTime -lt $staleThreshold }
 if ($staleFiles) {
-    Write-Warning "$($staleFiles.Count) archivo(s) en common/ (vanilla) NO se modificaron en esta corrida."
+    Write-Warning "$($staleFiles.Count) archivo(s) en common/ NO se modificaron en esta corrida (mas viejos que 10 minutos). Ejemplo: $($staleFiles[0].FullName) ($($staleFiles[0].LastWriteTime))"
 } else {
-    Write-Host "OK: todos los archivos en common/ (vanilla) son de esta corrida." -ForegroundColor Green
+    Write-Host "OK: todos los archivos en common/ son de esta corrida." -ForegroundColor Green
 }
 
-
-# --- Paso 7: Comprimir paquetes finales (Vanilla y Experimental) ---
-Write-Host "`n=== Paso 7: Comprimir common/ y plugins/ -> zips de salida ===" -ForegroundColor Cyan
+Write-Host "`n=== Paso 7: comprimir common/ y plugins/ -> zips de salida ===" -ForegroundColor Cyan
 $EtpOutputFolder = Join-Path $EtpWorkDir "etp_output"
 New-Item -ItemType Directory -Force -Path $EtpOutputFolder | Out-Null
 
@@ -220,27 +196,29 @@ $CommonExpZipOutput = Join-Path $EtpOutputFolder "common_exp.zip"
 if (Test-Path $CommonZipOutput) { Remove-Item $CommonZipOutput -Force }
 if (Test-Path $CommonExpZipOutput) { Remove-Item $CommonExpZipOutput -Force }
 
-# 1. Zip vanilla: solo common/ (versión limpia con restricciones de encoding)
-Compress-Archive -Path "$CommonFolder\*" -DestinationPath $CommonZipOutput -Force
-Write-Host "common.zip generado (solo common vanilla)" -ForegroundColor Green
+# 1. Zip vanilla: solo common/
+Compress-Archive -Path $CommonFolder -DestinationPath $CommonZipOutput -Force
+Write-Host "common.zip generado (solo common)" -ForegroundColor Green
 
-# 2. Zip experimental: common/ (versión con caracteres normales) + plugins/ (si existe plugins/)
+# 2. Zip experimental: common/ + plugins/ (si existe plugins/)
 $PluginsFolder = Join-Path $EtpWorkDir "plugins"
-$ExpFinalStaging = Join-Path $EtpOutputFolder "exp_final_staging"
-if (Test-Path $ExpFinalStaging) { Remove-Item $ExpFinalStaging -Recurse -Force }
-
-New-Item -ItemType Directory -Force -Path (Join-Path $ExpFinalStaging "common") | Out-Null
-Copy-Item "$ExpStagingCommon\*" (Join-Path $ExpFinalStaging "common") -Recurse -Force
-
 if (Test-Path $PluginsFolder) {
-    New-Item -ItemType Directory -Force -Path (Join-Path $ExpFinalStaging "plugins") | Out-Null
-    Copy-Item "$PluginsFolder\*" (Join-Path $ExpFinalStaging "plugins") -Recurse -Force
+    $ExpStaging = Join-Path $EtpOutputFolder "exp_staging"
+    if (Test-Path $ExpStaging) { Remove-Item $ExpStaging -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path (Join-Path $ExpStaging "common") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $ExpStaging "plugins") | Out-Null
+    
+    Copy-Item "$CommonFolder\*" (Join-Path $ExpStaging "common") -Recurse -Force
+    Copy-Item "$PluginsFolder\*" (Join-Path $ExpStaging "plugins") -Recurse -Force
+    
+    Compress-Archive -Path "$ExpStaging\*" -DestinationPath $CommonExpZipOutput -Force
+    Remove-Item $ExpStaging -Recurse -Force
+    Write-Host "common_exp.zip generado (common + plugins)" -ForegroundColor Green
+} else {
+    Write-Warning "Carpeta plugins no encontrada en $PluginsFolder, se usara solo common.zip para el experimental"
+    Copy-Item $CommonZipOutput $CommonExpZipOutput -Force
 }
 
-Compress-Archive -Path "$ExpFinalStaging\*" -DestinationPath $CommonExpZipOutput -Force
-Remove-Item $ExpStagingCommon -Recurse -Force
-Remove-Item $ExpFinalStaging -Recurse -Force
-Write-Host "common_exp.zip generado (common experimental + plugins)" -ForegroundColor Green
 Write-Host "`n=== Paso 8: armar paste_in_dqxclarity.zip ===" -ForegroundColor Cyan
 $PasteStaging = Join-Path $EtpWorkDir "etp_output\paste_in_dqxclarity_staging\dqxclarity"
 $PasteMiscFiles = Join-Path $PasteStaging "misc_files"
