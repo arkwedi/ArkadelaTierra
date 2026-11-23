@@ -79,7 +79,7 @@ def load_entries(path: Path):
             yield entry_id, ja, en
 
 
-def build_database(json_folders, db_path: Path, overwrite: bool):
+def build_database(json_folder: Path, db_path: Path, overwrite: bool):
     if db_path.exists():
         if overwrite:
             db_path.unlink()
@@ -98,8 +98,7 @@ def build_database(json_folders, db_path: Path, overwrite: bool):
     total_files = 0
     skipped_duplicates = 0
 
-    json_paths = [p for folder in json_folders for p in iter_json_files(folder)]
-    for json_path in json_paths:
+    for json_path in iter_json_files(json_folder):
         file_key = json_path.stem  # filename without .json
         rows = list(load_entries(json_path))
         if not rows:
@@ -133,8 +132,7 @@ def build_database(json_folders, db_path: Path, overwrite: bool):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("json_folder", type=Path, nargs="+",
-                        help="One or more folders containing .json files (all go into one DB)")
+    parser.add_argument("json_folder", type=Path, help="Folder containing the .json files")
     parser.add_argument(
         "--output", "-o", type=Path, default=Path("translations.db"),
         help="Path for the resulting SQLite database (default: translations.db)",
@@ -145,10 +143,9 @@ def main():
     )
     args = parser.parse_args()
 
-    for folder in args.json_folder:
-        if not folder.is_dir():
-            print(f"[!] {folder} is not a folder", file=sys.stderr)
-            sys.exit(1)
+    if not args.json_folder.is_dir():
+        print(f"[!] {args.json_folder} is not a folder", file=sys.stderr)
+        sys.exit(1)
 
     build_database(args.json_folder, args.output, args.overwrite)
 
