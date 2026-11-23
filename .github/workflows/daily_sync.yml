@@ -81,7 +81,6 @@ jobs:
           --language es
           --download-url "https://github.com/${{ github.repository }}/releases/download/nightly/espanol_exp.clpk"
           --disable-text-normalization
-          --allow-drop-url
 
       - name: Upload review CSV as workflow artifact
         if: always()

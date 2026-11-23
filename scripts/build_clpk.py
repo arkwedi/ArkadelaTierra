@@ -9,13 +9,14 @@ code involved.
 
 Format (confirmed by parsing a real .clpk byte-for-byte):
     bytes 0-3   : magic b"CLPK"
-    bytes 4-5   : version, uint16 little-endian (currently 1)
-    byte  6     : length of the metadata JSON, as a single byte (0-255)
-    next N bytes: metadata JSON (UTF-8), where N = the byte above
-                  {"sha": <sha256 hex of the zip payload>,
-                   "author": "...", "language": "...",
-                   "builtAt": <unix timestamp>, "download_url": "...",
-                   optional: "disable_text_normalization": true}
+    byte  4     : version, 1 byte (currently 1)
+    bytes 5-6   : length N of the metadata JSON, uint16 BIG-endian (0-65535)
+    next N bytes: metadata JSON (UTF-8)
+                  {"sha": <sha256 hex of the zip payload>, "language": "...",
+                   "author": "...", "builtAt": <unix timestamp>, "download_url": "...",
+                   optional (only written when set, same as dqxclarity's own build-clpk.yml):
+                   "disable_text_normalization": true, "max_chars_per_line": 10-200,
+                   "max_lines_per_box": 1-20, "custom_translations_url": "https://github.com/<org>/<repo>"}
     rest of file: the original .zip, byte-for-byte, unmodified
 
 Usage:
@@ -23,12 +24,11 @@ Usage:
         --author "ArkadelaTierra" --language es \\
         --download-url "https://github.com/arkwedi/dqx-hispano/releases/download/nightly/common.zip"
 
+    --max-chars-per-line N / --max-lines-per-box N / --custom-translations-url URL
+                                  optional header fields, validated with dqxclarity's ranges.
     --disable-text-normalization  adds "disable_text_normalization": true (experimental pack, which ships the
                                   plugin that draws accents). Without the flag the key is omitted, which
-                                  Clarity treats as false (vanilla pack).
-    --allow-drop-url              if the metadata exceeds 255 bytes, drops download_url (with a warning)
-                                  instead of failing.
-"""
+                                  Clarity treats as false (vanilla pack)."""
 
 import argparse
 import hashlib
@@ -41,10 +41,12 @@ from pathlib import Path
 
 MAGIC = b"CLPK"
 VERSION = 1
+MAX_METADATA = 0xFFFF
 
 
 def build_clpk(zip_path: Path, output_path: Path, author: str, language: str, download_url: str,
-               disable_text_normalization: bool = False, allow_drop_url: bool = False):
+               disable_text_normalization: bool = False, max_chars_per_line=None,
+               max_lines_per_box=None, custom_translations_url=""):
     zip_data = zip_path.read_bytes()
 
     # Sanity check: make sure this is actually a valid zip before wrapping it --
@@ -63,37 +65,37 @@ def build_clpk(zip_path: Path, output_path: Path, author: str, language: str, do
     sha = hashlib.sha256(zip_data).hexdigest()
     metadata = {
         "sha": sha,
-        "author": author,
         "language": language,
+        "author": author,
         "builtAt": int(time.time()),
         "download_url": download_url,
     }
     if disable_text_normalization:
         metadata["disable_text_normalization"] = True
+    if max_chars_per_line is not None:
+        if not 10 <= max_chars_per_line <= 200:
+            sys.exit("[!] --max-chars-per-line debe estar entre 10 y 200")
+        metadata["max_chars_per_line"] = max_chars_per_line
+    if max_lines_per_box is not None:
+        if not 1 <= max_lines_per_box <= 20:
+            sys.exit("[!] --max-lines-per-box debe estar entre 1 y 20")
+        metadata["max_lines_per_box"] = max_lines_per_box
+    if custom_translations_url and custom_translations_url.strip():
+        metadata["custom_translations_url"] = custom_translations_url.strip()
 
     def encode(m):
         return json.dumps(m, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     metadata_bytes = encode(metadata)
 
-    if len(metadata_bytes) > 255 and allow_drop_url and metadata.get("download_url"):
-        print(f"[!] AVISO: la metadata mide {len(metadata_bytes)} bytes (max 255); se omite download_url "
-              f"({len(download_url)} caracteres). Clarity no podra actualizar este paquete por URL.", file=sys.stderr)
-        metadata["download_url"] = ""
-        metadata_bytes = encode(metadata)
-
-    if len(metadata_bytes) > 255:
-        print(
-            f"[!] El JSON de metadata mide {len(metadata_bytes)} bytes, pero el formato solo "
-            f"reserva 1 byte (max 255) para su longitud. Acorta --author/--download-url (o usa --allow-drop-url).",
-            file=sys.stderr,
-        )
+    if len(metadata_bytes) > MAX_METADATA:
+        print(f"[!] El JSON de metadata mide {len(metadata_bytes)} bytes (max {MAX_METADATA}).", file=sys.stderr)
         sys.exit(1)
 
     with open(output_path, "wb") as f:
         f.write(MAGIC)
-        f.write(struct.pack("<H", VERSION))
-        f.write(struct.pack("<B", len(metadata_bytes)))
+        f.write(struct.pack("<B", VERSION))
+        f.write(struct.pack(">H", len(metadata_bytes)))
         f.write(metadata_bytes)
         f.write(zip_data)
 
@@ -113,8 +115,9 @@ def main():
                          help="URL Clarity will poll for updates (e.g. your nightly Release asset URL)")
     parser.add_argument("--disable-text-normalization", action="store_true",
                          help='Agrega "disable_text_normalization": true a la metadata (paquete experimental con plugin)')
-    parser.add_argument("--allow-drop-url", action="store_true",
-                         help="Si la metadata supera 255 bytes, omite download_url con un aviso en vez de fallar")
+    parser.add_argument("--max-chars-per-line", type=int, default=None, help="Caracteres por linea de dialogo (10-200; default de Clarity 46)")
+    parser.add_argument("--max-lines-per-box", type=int, default=None, help="Lineas por caja de dialogo (1-20; default de Clarity 3)")
+    parser.add_argument("--custom-translations-url", default="", help="Repo de GitHub alternativo a dqx-custom-translations (https://github.com/<org>/<repo>)")
     args = parser.parse_args()
 
     if not args.zip_file.exists():
@@ -122,7 +125,8 @@ def main():
         sys.exit(1)
 
     build_clpk(args.zip_file, args.output, args.author, args.language, args.download_url,
-               args.disable_text_normalization, args.allow_drop_url)
+               args.disable_text_normalization, args.max_chars_per_line, args.max_lines_per_box,
+               args.custom_translations_url)
 
 
 if __name__ == "__main__":
