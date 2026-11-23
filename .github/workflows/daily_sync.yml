@@ -50,16 +50,15 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --only-binary=:all: psycopg2-binary
+          python -m pip install --only-binary=:all: psycopg2-binary openpyxl
 
-      - name: Run pipeline (etp.exe -> Supabase -> ETP -> clpk + paste_in_dqxclarity.zip)
+      - name: Run pipeline (etp.exe -> Supabase -> ETP + pack dqxclarity -> zips)
         shell: powershell
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           ETP_EXE_PATH: ${{ vars.ETP_EXE_PATH }}
           ETP_WORK_DIR: ${{ vars.ETP_WORK_DIR }}
-          CLARITY_GLOSSARY_DB_PATH: ${{ vars.CLARITY_GLOSSARY_DB_PATH }}
-          CLARITY_DIALOG_DB_PATH: ${{ vars.CLARITY_DIALOG_DB_PATH }}
+          MERGE_SHEET_URL: ${{ vars.MERGE_SHEET_URL }}
         run: ./run_daily_pipeline.ps1
 
       - name: Build español.clpk (Vanilla) desde common.zip
@@ -81,16 +80,16 @@ jobs:
           --author "-experimental- ArkadelaTierra"
           --language es
           --download-url "https://github.com/${{ github.repository }}/releases/download/nightly/espanol_exp.clpk"
+          --disable-text-normalization
+          --allow-drop-url
 
-      - name: Upload review CSV and Clarity DBs as workflow artifacts
+      - name: Upload review CSV as workflow artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: dqx-es-sync-${{ github.run_id }}
           path: |
             ${{ vars.ETP_WORK_DIR }}/logs/*.csv
-            ${{ vars.ETP_WORK_DIR }}/clarity_dbs/glossary.db
-            ${{ vars.ETP_WORK_DIR }}/clarity_dbs/clarity_dialog.db
           if-no-files-found: ignore
 
       - name: Publish nightly Release
@@ -104,7 +103,6 @@ jobs:
           files: |
             ${{ vars.ETP_WORK_DIR }}/etp_output/espanol.clpk
             ${{ vars.ETP_WORK_DIR }}/etp_output/espanol_exp.clpk
-            ${{ vars.ETP_WORK_DIR }}/etp_output/paste_in_dqxclarity.zip
             ${{ vars.ETP_WORK_DIR }}/etp_output/readme.md
 
       # Publica el snapshot EN + etp/rps de ESTA corrida exitosa como un

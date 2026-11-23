@@ -1,35 +1,31 @@
 # run_daily_pipeline.ps1
 #
-# End-to-end DQX ES pipeline, from the game's raw DAT files all the way to
-# a common.zip ready for Clarity's .clpk packaging tool. Collapses what
-# used to be 9 manual steps into one script call -- only the final
-# common.zip -> .clpk conversion (Clarity's own tool) stays manual, since
-# we don't yet know if that step has a CLI equivalent.
+# Pipeline DQX ES completo: de los DAT del juego a dos paquetes .clpk listos
+# (vanilla y experimental), que conviven con dqxclarity.
 #
-#   1. etp.exe all .                -> DAT -> raw JSON (ETPLocalizer, deja
-#                                      common/, etp/, json/, rps/ en la
-#                                      misma carpeta donde corres etp.exe)
-#   2. etp.exe port-translations .  -> merges in Clarity's current EN
-#   3. build_translation_db.py      -> JSON -> local SQLite snapshot
-#      (fuente real confirmada: json\_lang\en)
+#   1. etp.exe all .                -> DAT -> JSON crudo
+#   2. etp.exe port-translations .  -> mezcla el EN actual de Clarity
+#   2.5 fetch_clarity_sources.py    -> custom_*.json de dqx-custom-translations,
+#                                      ignore.py y merge.xlsx (Google Sheet), con
+#                                      copia de la ultima version buena
+#   3. build_translation_db.py      -> JSON del juego + custom_* -> SQLite local
 #   4. sync_json_updates.py         -> SQLite -> Supabase
-#   5. export_translations.py       -> Supabase -> ES JSON, escrito
-#                                      DIRECTAMENTE en json\_lang\en
-#                                      (confirmado como la ubicacion real
-#                                      que etp.exe rebuild lee) + fresh
-#                                      glossary.db / clarity_dialog.db en
-#                                      esa misma carpeta
-#   6. etp.exe rebuild . .          -> JSON -> ETP binaries in common/
-#   7. Empaquetar DOS zips con la misma estructura (carpetas en la raiz):
-#        common.zip     (Vanilla)      -> common/                (clean-encoding, SIN plugin)
-#        common_exp.zip (Experimental) -> common/ + plugin       (sin clean-encoding, CON plugin)
+#   5. export_translations.py       -> Supabase -> ES JSON (json\_lang\en) y, por
+#                                      variante, un pack dqxclarity\ (6 nombres,
+#                                      custom_*, glossary.csv, merge.xlsx)
+#   6. etp.exe rebuild . .          -> JSON -> ETP binarios en common\
+#   7. Dos zips con la misma logica de estructura:
+#        common.zip     (Vanilla)      -> common + dqxclarity           (--clean-encoding)
+#        common_exp.zip (Experimental) -> common + plugins + dqxclarity (sin limpiar)
+#      dqxclarity\ NO se extrae: dqxclarity lo lee directamente del .clpk.
 #
-# This script is meant to be run the same way whether you trigger it by
-# hand or via a scheduled GitHub Actions self-hosted runner -- all the
-# logic lives here, not duplicated in the workflow YAML.
+# -FromSnapshot: modo de respaldo (PC apagada). Se salta los Pasos 1-2 y usa el
+# snapshot (json\_lang\en, etp\, rps\, plugins\, fetch_cache\) que el workflow
+# dejo en ETP_WORK_DIR. run_daily_pipeline_fallback.ps1 solo llama a este script.
 #
-# Requires: DATABASE_URL environment variable set to your Supabase
-# connection string (pooler, not direct -- see earlier notes on IPv6).
+# Requiere: DATABASE_URL (pooler de Supabase). Opcional: MERGE_SHEET_URL (Google
+# Sheet con el merge, compartido "cualquiera con el enlace puede ver").
+param([switch]$FromSnapshot)
 
 $ErrorActionPreference = "Stop"
 
@@ -95,12 +91,13 @@ if (Test-Path $envFile) {
 $EtpExe             = $env:ETP_EXE_PATH
 $EtpWorkDir         = $env:ETP_WORK_DIR
 $LocalDb            = Join-Path $EtpWorkDir "translations.db"
-$ClarityDbOutput    = Join-Path $EtpWorkDir "clarity_dbs"   # separado de json\_lang\en a proposito
 $ChangedReviewCsv   = Join-Path $EtpWorkDir "logs\ja_changed_$(Get-Date -Format yyyy-MM-dd).csv"
 $BackupCsv          = Join-Path $EtpWorkDir "backups\backup_$(Get-Date -Format yyyy-MM-dd).csv"
-$ClarityGlossaryDb  = $env:CLARITY_GLOSSARY_DB_PATH
-$ClarityDialogDb    = $env:CLARITY_DIALOG_DB_PATH
-$CommonZipOutput    = Join-Path $EtpWorkDir "etp_output\common.zip"
+$SheetUrl           = $env:MERGE_SHEET_URL
+$FetchOut           = Join-Path $EtpWorkDir "clarity_sources"
+$FetchCache         = Join-Path $EtpWorkDir "fetch_cache"
+$PackExp            = Join-Path $EtpWorkDir "pack_exp"
+$PackVanilla        = Join-Path $EtpWorkDir "pack_vanilla"
 
 if (-not $env:DATABASE_URL) {
     Write-Error "DATABASE_URL no esta definida. Configurala antes de correr este script."
@@ -115,31 +112,48 @@ if (-not $EtpWorkDir -or -not (Test-Path $EtpWorkDir)) {
     exit 1
 }
 
-# Limpiar restos de corridas anteriores ANTES de extraer/reconstruir --
-# common/, etp/, rps/ no se limpian solas entre corridas, asi que sin esto
-# es posible que un common.zip termine con una mezcla de RPS nuevos y
-# viejos (de antes de un fix, por ejemplo). Preferimos una corrida un poco
-# mas lenta pero garantizadamente limpia.
-foreach ($folder in @("common", "etp", "rps")) {
-    $path = Join-Path $EtpWorkDir $folder
-    if (Test-Path $path) {
-        Write-Host "Limpiando $path de una corrida anterior..." -ForegroundColor DarkGray
-        Remove-Item $path -Recurse -Force
+# Plugin del paquete experimental: debe llamarse EXACTAMENTE "plugins" dentro del zip.
+$PluginFolder = $null
+$pluginCandidates = @(
+    (Join-Path $EtpWorkDir "plugins"),
+    (Join-Path $EtpWorkDir "plugin"),
+    (Join-Path $PSScriptRoot "plugins"),
+    (Join-Path $PSScriptRoot "plugin")
+)
+foreach ($candidate in $pluginCandidates) {
+    if (Test-Path $candidate -PathType Container) { $PluginFolder = $candidate; break }
+}
+if (-not $PluginFolder) {
+    throw "No se encontro la carpeta plugins para el paquete experimental. Busque en:`n  " + ($pluginCandidates -join "`n  ")
+}
+Write-Host "Carpeta plugins: $PluginFolder" -ForegroundColor DarkGray
+
+if (-not $FromSnapshot) {
+    # Limpiar restos de corridas anteriores ANTES de extraer/reconstruir.
+    foreach ($folder in @("common", "etp", "rps")) {
+        $path = Join-Path $EtpWorkDir $folder
+        if (Test-Path $path) {
+            Write-Host "Limpiando $path de una corrida anterior..." -ForegroundColor DarkGray
+            Remove-Item $path -Recurse -Force
+        }
+    }
+
+    Push-Location $EtpWorkDir
+    try {
+        Write-Host "=== Paso 1: DAT -> JSON crudo (etp.exe all .) ===" -ForegroundColor Cyan
+        & $EtpExe all .
+        if ($LASTEXITCODE -ne 0) { throw "etp.exe all fallo" }
+
+        Write-Host "`n=== Paso 2: importar EN de Clarity (etp.exe port-translations .) ===" -ForegroundColor Cyan
+        & $EtpExe port-translations .
+        if ($LASTEXITCODE -ne 0) { throw "etp.exe port-translations fallo" }
+    }
+    finally {
+        Pop-Location
     }
 }
-
-Push-Location $EtpWorkDir
-try {
-    Write-Host "=== Paso 1: DAT -> JSON crudo (etp.exe all .) ===" -ForegroundColor Cyan
-    & $EtpExe all .
-    if ($LASTEXITCODE -ne 0) { throw "etp.exe all fallo" }
-
-    Write-Host "`n=== Paso 2: importar EN de Clarity (etp.exe port-translations .) ===" -ForegroundColor Cyan
-    & $EtpExe port-translations .
-    if ($LASTEXITCODE -ne 0) { throw "etp.exe port-translations fallo" }
-}
-finally {
-    Pop-Location
+else {
+    Write-Host "Modo -FromSnapshot: sin etp.exe all / port-translations (se usa el snapshot)" -ForegroundColor Yellow
 }
 
 $RawJsonFolder = Join-Path $EtpWorkDir "json\_lang\en"
@@ -150,24 +164,42 @@ if (-not (Test-Path $RawJsonFolder) -or (Get-ChildItem $RawJsonFolder -Filter *.
 $jsonFileCount = (Get-ChildItem $RawJsonFolder -Filter *.json -Recurse).Count
 Write-Host "OK: $jsonFileCount JSON de origen en $RawJsonFolder"
 
+Write-Host "`n=== Paso 2.5: fuentes de dqxclarity (fetch_clarity_sources.py) ===" -ForegroundColor Cyan
+$fetchArgs = @("--out-dir", $FetchOut, "--cache-dir", $FetchCache)
+if ($SheetUrl) { $fetchArgs += @("--sheet-url", $SheetUrl) }
+python scripts\fetch_clarity_sources.py @fetchArgs
+if ($LASTEXITCODE -ne 0) { Write-Error "fetch_clarity_sources.py fallo"; exit 1 }
+$CustomJsonFolder = Join-Path $FetchOut "custom_json"
+$MergeXlsx        = Join-Path $FetchOut "merge.xlsx"
+$IgnoreFile       = Join-Path $FetchOut "ignore.py"
+if (-not (Get-ChildItem $CustomJsonFolder -Filter custom_*.json -ErrorAction SilentlyContinue)) {
+    Write-Host "[!] Sin custom_*.json de upstream: el pack saldra solo con los 6 nombres + lo que ya este en Supabase." -ForegroundColor Yellow
+}
+if (-not (Test-Path $MergeXlsx)) {
+    Write-Host "[!] Sin merge.xlsx: el pack llevara una plantilla vacia." -ForegroundColor Yellow
+}
+
 # --- Snapshot para runs de respaldo (fallback) ---
-# En este punto json\_lang\en todavia tiene el EN recien extraido/mergeado
-# (Paso 5 lo va a sobreescribir con ES mas adelante), y etp\ + rps\ ya
-# tienen la estructura que "etp.exe rebuild" necesita como base. Guardamos
-# una copia de estos tres antes de que se pierdan, para que un run sin PC
-# encendida (sin etp.exe / sin el juego) pueda saltarse los Pasos 1-2 y
-# reusar esto como "la ultima copia buena".
-Write-Host "`n=== Guardando snapshot de origen para runs de respaldo (source_cache) ===" -ForegroundColor Cyan
-$SourceCacheDir = Join-Path $EtpWorkDir "source_cache"
-if (Test-Path $SourceCacheDir) { Remove-Item $SourceCacheDir -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $SourceCacheDir | Out-Null
-Copy-Item $RawJsonFolder (Join-Path $SourceCacheDir "json_lang_en") -Recurse
-Copy-Item (Join-Path $EtpWorkDir "etp") (Join-Path $SourceCacheDir "etp") -Recurse
-Copy-Item (Join-Path $EtpWorkDir "rps") (Join-Path $SourceCacheDir "rps") -Recurse
-Write-Host "Snapshot guardado en $SourceCacheDir" -ForegroundColor Green
+# json\_lang\en todavia tiene el EN recien extraido (el Paso 5 lo sobreescribe con ES),
+# y etp\ + rps\ son la base de "etp.exe rebuild". Se guardan tambien plugins\ y
+# fetch_cache\ (ultimas fuentes buenas) para que un run sin PC arme los mismos paquetes.
+if (-not $FromSnapshot) {
+    Write-Host "`n=== Guardando snapshot de origen para runs de respaldo (source_cache) ===" -ForegroundColor Cyan
+    $SourceCacheDir = Join-Path $EtpWorkDir "source_cache"
+    if (Test-Path $SourceCacheDir) { Remove-Item $SourceCacheDir -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $SourceCacheDir | Out-Null
+    Copy-Item $RawJsonFolder (Join-Path $SourceCacheDir "json_lang_en") -Recurse
+    Copy-Item (Join-Path $EtpWorkDir "etp") (Join-Path $SourceCacheDir "etp") -Recurse
+    Copy-Item (Join-Path $EtpWorkDir "rps") (Join-Path $SourceCacheDir "rps") -Recurse
+    Copy-Item $PluginFolder (Join-Path $SourceCacheDir "plugins") -Recurse
+    if (Test-Path $FetchCache) { Copy-Item $FetchCache (Join-Path $SourceCacheDir "fetch_cache") -Recurse }
+    Write-Host "Snapshot guardado en $SourceCacheDir" -ForegroundColor Green
+}
 
 Write-Host "`n=== Paso 3: construir snapshot local (build_translation_db.py) ===" -ForegroundColor Cyan
-python scripts\build_translation_db.py $RawJsonFolder --output $LocalDb --overwrite
+$dbInputs = @($RawJsonFolder)
+if (Get-ChildItem $CustomJsonFolder -Filter custom_*.json -ErrorAction SilentlyContinue) { $dbInputs += $CustomJsonFolder }
+python scripts\build_translation_db.py @dbInputs --output $LocalDb --overwrite
 if ($LASTEXITCODE -ne 0) { Write-Error "build_translation_db.py fallo"; exit 1 }
 
 Write-Host "`n=== Paso 4: sincronizar con Supabase (sync_json_updates.py) ===" -ForegroundColor Cyan
@@ -179,29 +211,22 @@ if (Test-Path $ChangedReviewCsv) {
     Write-Host "`n[!] Hay entradas con JA modificado que requieren revision manual: $ChangedReviewCsv" -ForegroundColor Yellow
 }
 
-# --- Versión Experimental (Caracteres normales) ---
-Write-Host "`n=== Paso 5.1 (Experimental): Supabase -> JSON normal + DBs de Clarity ===" -ForegroundColor Cyan
-New-Item -ItemType Directory -Force -Path $ClarityDbOutput | Out-Null
+# Argumentos comunes del pack dqxclarity (merge/ignore/overrides solo si existen)
+$packExtra = @()
+if (Test-Path $MergeXlsx)  { $packExtra += @("--merge-xlsx", $MergeXlsx) }
+if (Test-Path $IgnoreFile) { $packExtra += @("--ignore-file", $IgnoreFile) }
+$OverridesFile = Join-Path $PSScriptRoot "scripts\glossary_overrides.csv"
+if (Test-Path $OverridesFile) { $packExtra += @("--glossary-overrides", $OverridesFile) }
+
+# --- Version Experimental (caracteres normales) ---
+Write-Host "`n=== Paso 5.1 (Experimental): Supabase -> JSON normal + pack dqxclarity ===" -ForegroundColor Cyan
 $exportArgsExp = @(
     "--lang", "es", "--all",
     "--output", $RawJsonFolder,
-    "--build-clarity-dbs",
-    "--clarity-db-output", $ClarityDbOutput
-)
+    "--clarity-pack-dir", $PackExp
+) + $packExtra
 python scripts\export_translations.py @exportArgsExp
 if ($LASTEXITCODE -ne 0) { Write-Error "export_translations.py (experimental) fallo"; exit 1 }
-
-# Copiamos bases de datos de Clarity si están configuradas
-$generatedGlossaryDb = Join-Path $ClarityDbOutput "glossary.db"
-$generatedDialogDb   = Join-Path $ClarityDbOutput "clarity_dialog.db"
-if ($ClarityGlossaryDb -and (Test-Path $generatedGlossaryDb)) {
-    Copy-Item $generatedGlossaryDb $ClarityGlossaryDb -Force
-    Write-Host "glossary.db copiada a $ClarityGlossaryDb"
-}
-if ($ClarityDialogDb -and (Test-Path $generatedDialogDb)) {
-    Copy-Item $generatedDialogDb $ClarityDialogDb -Force
-    Write-Host "clarity_dialog.db copiada a $ClarityDialogDb"
-}
 
 Write-Host "`n=== Paso 6.1 (Experimental): etp.exe rebuild (experimental) ===" -ForegroundColor Cyan
 Push-Location $EtpWorkDir
@@ -226,12 +251,13 @@ Copy-Item $CommonFolder $ExpStagingCommon -Recurse
 
 
 # --- Versión Vanilla / Segura (Con limpieza de encoding / REPLACE_MAP) ---
-Write-Host "`n=== Paso 5.2 (Vanilla): Supabase -> JSON con limpieza de encoding ===" -ForegroundColor Cyan
+Write-Host "`n=== Paso 5.2 (Vanilla): Supabase -> JSON con limpieza de encoding + pack dqxclarity ===" -ForegroundColor Cyan
 $exportArgsVanilla = @(
     "--lang", "es", "--all",
     "--output", $RawJsonFolder,
-    "--clean-encoding"
-)
+    "--clean-encoding",
+    "--clarity-pack-dir", $PackVanilla
+) + $packExtra
 python scripts\export_translations.py @exportArgsVanilla
 if ($LASTEXITCODE -ne 0) { Write-Error "export_translations.py (vanilla) fallo"; exit 1 }
 
@@ -280,78 +306,63 @@ New-Item -ItemType Directory -Force -Path $EtpOutputFolder | Out-Null
 $CommonZipOutput    = Join-Path $EtpOutputFolder "common.zip"      # Vanilla: common/ limpio, SIN plugin
 $CommonExpZipOutput = Join-Path $EtpOutputFolder "common_exp.zip"  # Experimental: common/ sin limpiar + plugin
 
-# Localizar la carpeta plugin. Antes el script buscaba SOLO "plugins" en ETP_WORK_DIR y, si no
-# existia, solo emitia un warning y publicaba el experimental SIN plugin. Ahora acepta
-# "plugin" o "plugins" (en ETP_WORK_DIR o junto al script) y FALLA si no la encuentra.
-$PluginFolder = $null
-$pluginCandidates = @(
-    (Join-Path $EtpWorkDir "plugin"),
-    (Join-Path $EtpWorkDir "plugins"),
-    (Join-Path $PSScriptRoot "plugin"),
-    (Join-Path $PSScriptRoot "plugins")
-)
-foreach ($candidate in $pluginCandidates) {
-    if (Test-Path $candidate -PathType Container) { $PluginFolder = $candidate; break }
+foreach ($p in @($PackExp, $PackVanilla)) {
+    if (-not (Test-Path (Join-Path $p "dqxclarity\custom-translations\csv\glossary.csv"))) {
+        throw "El pack $p no tiene dqxclarity\custom-translations\csv\glossary.csv"
+    }
 }
-if (-not $PluginFolder) {
-    throw "No se encontro la carpeta plugin para el paquete experimental. Busque en:`n  " + ($pluginCandidates -join "`n  ")
-}
-$PluginZipName = Split-Path $PluginFolder -Leaf
-Write-Host "Carpeta plugin encontrada: $PluginFolder" -ForegroundColor DarkGray
 
-# 1. Vanilla: SOLO common/ (construido con --clean-encoding). Sin plugin.
+# 1. Vanilla: common/ (clean-encoding) + dqxclarity/ (vanilla). Sin plugin.
 New-ZipFromFolders -DestinationPath $CommonZipOutput -Folders ([ordered]@{
-    "common" = $CommonFolder
+    "common"     = $CommonFolder
+    "dqxclarity" = (Join-Path $PackVanilla "dqxclarity")
 })
 
-# 2. Experimental: common/ (construido SIN clean-encoding, respaldado en el staging) + plugin
+# 2. Experimental: common/ (sin limpiar, del staging) + plugins/ + dqxclarity/ (experimental)
 New-ZipFromFolders -DestinationPath $CommonExpZipOutput -Folders ([ordered]@{
-    "common"       = $ExpStagingCommon
-    $PluginZipName = $PluginFolder
+    "common"     = $ExpStagingCommon
+    "plugins"    = $PluginFolder
+    "dqxclarity" = (Join-Path $PackExp "dqxclarity")
 })
 
 Remove-Item $ExpStagingCommon -Recurse -Force
 
 # Verificacion de la estructura final de ambos zips
-$vanillaTop = Get-ZipTopLevelNames $CommonZipOutput
-$expTop     = Get-ZipTopLevelNames $CommonExpZipOutput
-
-if (($vanillaTop -join ",") -ne "common") {
-    throw "common.zip (vanilla) tiene una estructura inesperada: $($vanillaTop -join ', ') (se esperaba solo 'common')"
+$vanillaTop = @(Get-ZipTopLevelNames $CommonZipOutput | Sort-Object)
+$expTop     = @(Get-ZipTopLevelNames $CommonExpZipOutput | Sort-Object)
+if (($vanillaTop -join ",") -ne "common,dqxclarity") {
+    throw "common.zip (vanilla) tiene una estructura inesperada: $($vanillaTop -join ', ') (se esperaba common, dqxclarity)"
 }
-if ($expTop -notcontains "common" -or $expTop -notcontains $PluginZipName -or $expTop.Count -ne 2) {
-    throw "common_exp.zip (experimental) tiene una estructura inesperada: $($expTop -join ', ') (se esperaba 'common' + '$PluginZipName')"
+if (($expTop -join ",") -ne "common,dqxclarity,plugins") {
+    throw "common_exp.zip (experimental) tiene una estructura inesperada: $($expTop -join ', ') (se esperaba common, dqxclarity, plugins)"
 }
-Write-Host "common.zip generado (Vanilla): [$($vanillaTop -join ', ')] -> clean-encoding, sin plugin" -ForegroundColor Green
-Write-Host "common_exp.zip generado (Experimental): [$($expTop -join ', ')] -> texto sin limpiar, con plugin" -ForegroundColor Green
-
-Write-Host "`n=== Paso 8: armar paste_in_dqxclarity.zip ===" -ForegroundColor Cyan
-$PasteStaging = Join-Path $EtpWorkDir "etp_output\paste_in_dqxclarity_staging\dqxclarity"
-$PasteMiscFiles = Join-Path $PasteStaging "misc_files"
-if (Test-Path (Join-Path $EtpWorkDir "etp_output\paste_in_dqxclarity_staging")) {
-    Remove-Item (Join-Path $EtpWorkDir "etp_output\paste_in_dqxclarity_staging") -Recurse -Force
+foreach ($zp in @($CommonZipOutput, $CommonExpZipOutput)) {
+    $zz = [System.IO.Compression.ZipFile]::OpenRead($zp)
+    try {
+        $names = @($zz.Entries | ForEach-Object { $_.FullName })
+        foreach ($need in @("dqxclarity/json/subPackage02Client.json", "dqxclarity/json/smldt_msg_pkg_NPC_DB.json",
+                            "dqxclarity/json/subPackage05Client.json", "dqxclarity/json/subPackage41Client.json",
+                            "dqxclarity/json/eventTextSysQuestaClient.json", "dqxclarity/json/eventTextSysEventaClient.json",
+                            "dqxclarity/custom-translations/csv/glossary.csv", "dqxclarity/custom-translations/csv/merge.xlsx")) {
+            if ($names -notcontains $need) { throw "$(Split-Path $zp -Leaf) no contiene $need" }
+        }
+    }
+    finally { $zz.Dispose() }
 }
-New-Item -ItemType Directory -Force -Path $PasteMiscFiles | Out-Null
-
-Copy-Item (Join-Path $PSScriptRoot "clarity_patch\main.py") (Join-Path $PasteStaging "main.py") -Force
-Copy-Item (Join-Path $PSScriptRoot "clarity_patch\original_main.py") (Join-Path $PasteStaging "original_main.py") -Force
-Copy-Item (Join-Path $ClarityDbOutput "glossary.db") (Join-Path $PasteMiscFiles "glossary.db") -Force
-Copy-Item (Join-Path $ClarityDbOutput "clarity_dialog.db") (Join-Path $PasteMiscFiles "clarity_dialog.db") -Force
-
-$PasteZipOutput = Join-Path $EtpWorkDir "etp_output\paste_in_dqxclarity.zip"
-if (Test-Path $PasteZipOutput) { Remove-Item $PasteZipOutput }
-Compress-Archive -Path $PasteStaging -DestinationPath $PasteZipOutput
-Write-Host "paste_in_dqxclarity.zip generado en: $PasteZipOutput" -ForegroundColor Green
+Write-Host "common.zip generado (Vanilla): [$($vanillaTop -join ', ')] -> clean-encoding, sin plugins" -ForegroundColor Green
+Write-Host "common_exp.zip generado (Experimental): [$($expTop -join ', ')] -> texto sin limpiar, con plugins" -ForegroundColor Green
 
 # Copiamos el readme del repo (estatico, lo editas tu directamente en el
 # repositorio) junto al resto de los entregables de esta corrida.
 Copy-Item (Join-Path $PSScriptRoot "readme.md") (Join-Path $EtpWorkDir "etp_output\readme.md") -Force
 
-Write-Host "`n=== Paso 9: comprimir source_cache (snapshot para fallback) ===" -ForegroundColor Cyan
-$SourceCacheZip = Join-Path $EtpWorkDir "source_cache.zip"
-if (Test-Path $SourceCacheZip) { Remove-Item $SourceCacheZip }
-Compress-Archive -Path (Join-Path $SourceCacheDir "*") -DestinationPath $SourceCacheZip
-Write-Host "source_cache.zip generado en: $SourceCacheZip" -ForegroundColor Green
+if (-not $FromSnapshot) {
+    Write-Host "`n=== Paso 8: comprimir source_cache (snapshot para fallback) ===" -ForegroundColor Cyan
+    $SourceCacheZip = Join-Path $EtpWorkDir "source_cache.zip"
+    if (Test-Path $SourceCacheZip) { Remove-Item $SourceCacheZip }
+    Compress-Archive -Path (Join-Path $SourceCacheDir "*") -DestinationPath $SourceCacheZip
+    Write-Host "source_cache.zip generado en: $SourceCacheZip" -ForegroundColor Green
+}
 
 Write-Host "`n=== Listo ===" -ForegroundColor Green
 Write-Host "common.zip (vanilla) generado en: $CommonZipOutput"
